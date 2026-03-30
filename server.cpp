@@ -1,0 +1,105 @@
+#include<iostream>
+#include<cstring>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <fcntl.h>
+#include <arpa/inet.h>
+#include <sys/select.h>
+#include <vector>
+#include <unistd.h>
+#include <string>
+
+std::string read_data(int client){
+    uint32_t len;
+    int received = 0;
+    while(received < sizeof(uint32_t)){
+        int x = read(client, reinterpret_cast<char*>(&len), sizeof(uint32_t) - received);
+        if(x <= 0){
+            return "";
+        }
+        received += x;
+    }
+    len = ntohl(received);
+    std::vector<char>buffer(len);
+    received = 0;
+    while(received < len){
+        int n = read(client, buffer.data() + received, len - received);
+        if(n <= 0) return "";
+        received += n;
+    }
+    return std::string(buffer.begin(), buffer.end());
+
+}
+int main(){
+    int sockfd, portno = 9000, newsockfd;
+    sockfd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if(sockfd < 0){
+        std::cout<<"failed to start socket" << std::endl;
+    }else{
+        std::cout<<"Socket is started" << std::endl;
+    }
+    struct sockaddr_in serv_addr, cli_addr;
+    memset((char*)&serv_addr, 0, sizeof(serv_addr));
+
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port = htons(portno);
+    serv_addr.sin_addr.s_addr = INADDR_ANY;
+
+    
+    if(bind(sockfd, (sockaddr*)&serv_addr, sizeof(serv_addr))){
+        std::cout<<"Failed to bind socket with address" << std::endl;
+    }else{
+        std::cout<<"Socket bind with address" << std::endl;
+    }
+    if(listen(sockfd, 5)){
+        std::cout<<"Failed to listening" << std::endl;
+    }else{
+        std::cout<<"Started to listening on local port 9000" << std::endl;
+    }
+    
+    std::vector<int> clients;
+    while(true){
+        fd_set fr, fw, fe;
+        FD_ZERO(&fr);
+        FD_SET(sockfd, &fr);
+        int max_fd = sockfd;
+        for(int client: clients){
+            FD_SET(client, &fr);
+            max_fd = std::max(max_fd, client);
+        }
+        select(max_fd + 1, &fr, NULL, NULL, NULL);
+        if(FD_ISSET(sockfd, &fr)){
+            socklen_t clilen = sizeof(cli_addr);
+            newsockfd = accept(sockfd, (sockaddr*)&cli_addr, &clilen);
+            clients.push_back(newsockfd);
+            std::cout << "new client connected " << newsockfd << std::endl;
+        }
+        for(int client: clients){
+            if(FD_ISSET(client, &fr)){
+                std::string data = read_data(client);
+                std::cout << data << std::endl;
+            }
+        }
+    }
+}
+// https://www.linkedin.com/posts/quantitative-finance-cohort-25_roadmap-for-learning-low-latency-c-activity-7301555373499367424-dIg8/
+
+/*
+structure of sockaddr_in: 
+struct sockaddr_in{
+    sin_family = AF_INET; -> more common
+    sin_port = htons(port); -> port on which server is running 
+    struct sin_addr s_addr = INADDR_ANY or 27.0.0.01; -> host name
+    and an array which is generally stay empty
+}
+
+htons: -> learn about endian concept where (htons and ntohs) are used.
+ 
+
+fd_set -> if there are multiple client then store their fd in binary so that no client have to wait for their turn manually
+
+everysocket is default blocking socket, learn about non-blocking sockets also
+*/
+
+
+
