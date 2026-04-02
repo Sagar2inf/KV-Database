@@ -6,10 +6,12 @@
 #include<netdb.h>
 #include<arpa/inet.h>
 #include<string>
+#include <vector>
+#include "./transport/transport.hpp"
 
+Transport transport;
 int main(){
     int sockfd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    char buffer[256];
     struct sockaddr_in serv_addr;
     serv_addr.sin_family = AF_INET;
     serv_addr.sin_port = htons(9000);
@@ -17,9 +19,14 @@ int main(){
 
     connect(sockfd, (sockaddr*)&serv_addr, sizeof(serv_addr));
 
-    std::string message = "set x = 12\n";
-    uint32_t len = htons(message.size());
-    write(sockfd, &len, sizeof(len));
-    write(sockfd, message.c_str(), message.size());
-
+    std::string message = "set x = 12";
+    std::vector<uint8_t> buffer(message.begin(), message.end());
+    transport.write_data(sockfd, buffer);
+    std::cout<<"data sent" << std::endl;
+    buffer.clear();
+    buffer = transport.read_data(sockfd);
+    for(auto & it: buffer){
+        std::cout << it;
+    }
+    std::cout << std::endl;   
 }

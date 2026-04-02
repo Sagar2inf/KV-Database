@@ -8,28 +8,12 @@
 #include <vector>
 #include <unistd.h>
 #include <string>
+#include <netdb.h>
+#include "./routers/router.hpp"
+#include "./transport/transport.hpp"
 
-std::string read_data(int client){
-    uint32_t len;
-    int received = 0;
-    while(received < sizeof(uint32_t)){
-        int x = read(client, reinterpret_cast<char*>(&len), sizeof(uint32_t) - received);
-        if(x <= 0){
-            return "";
-        }
-        received += x;
-    }
-    len = ntohl(received);
-    std::vector<char>buffer(len);
-    received = 0;
-    while(received < len){
-        int n = read(client, buffer.data() + received, len - received);
-        if(n <= 0) return "";
-        received += n;
-    }
-    return std::string(buffer.begin(), buffer.end());
-
-}
+Router router;
+Transport transport;
 int main(){
     int sockfd, portno = 9000, newsockfd;
     sockfd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -61,24 +45,42 @@ int main(){
     while(true){
         fd_set fr, fw, fe;
         FD_ZERO(&fr);
+        FD_ZERO(&fw);
         FD_SET(sockfd, &fr);
+        FD_SET(sockfd, &fw);
         int max_fd = sockfd;
         for(int client: clients){
             FD_SET(client, &fr);
+            FD_SET(client, &fw);
             max_fd = std::max(max_fd, client);
         }
-        select(max_fd + 1, &fr, NULL, NULL, NULL);
+        select(max_fd + 1, &fr, &fw, NULL, NULL);
         if(FD_ISSET(sockfd, &fr)){
             socklen_t clilen = sizeof(cli_addr);
             newsockfd = accept(sockfd, (sockaddr*)&cli_addr, &clilen);
             clients.push_back(newsockfd);
             std::cout << "new client connected " << newsockfd << std::endl;
         }
-        for(int client: clients){
+        for(auto it = clients.begin(); it != clients.end();){
+            int client = *it;
             if(FD_ISSET(client, &fr)){
-                std::string data = read_data(client);
-                std::cout << data << std::endl;
+                std::vector<uint8_t> data = transport.read_data(client);
+                if(data.empty()){
+                    cout << "client disconnected" << endl;
+                    close(client);
+                    it = clients.erase(it);
+                    continue;
+                }    
+                
+                std::vector<uint8_t> res = router.pass_data(data);
+                cout << "writing data" << endl;
+                bool chk = transport.write_data(client, res);
+                if(!chk){
+                    cout << "Couldn't sent data" << endl;
+                }
+                cout << "data written" << endl;
             }
+            it++;
         }
     }
 }
