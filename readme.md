@@ -1,4 +1,4 @@
-#### Key-Value Store System
+# Key-Value Store System
 ![flow diagram](./KV-flowchart.drawio.svg)
 
 
