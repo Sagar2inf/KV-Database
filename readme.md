@@ -63,5 +63,3 @@ SET x 42
 GET x
 ```
 - Or write a script.kv file and feed it directly to client using `./client < script.kv`
-
-[NOTE] I am continuously working on it, will make it distributed in upcoming few days.
