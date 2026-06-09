@@ -1,92 +1,134 @@
 #include "memtable.hpp"
+#include <iostream>
 
-bool Memtable::set_skiplist(string key, vector<uint8_t>& value){
-    try{
-        skiplist->insert(key, value);
-        return true;
-    } catch(...){
-        return false;
-    }
-}
-bool Memtable::set_wal(const vector<uint8_t>& data){
-    try{
-        wal->write_data(data);
-        return true;
-    } catch(...){
-        return false;
-    }
-}
-bool Memtable::remove(string key){
-    try{
-        skiplist->remove(key);
-        return true;
-    } catch(...){
-        return false;
-    }
-}
-vector<uint8_t> Memtable::get(string key){
-    try{
-        vector<uint8_t> res = skiplist->get(key);
-        return res;
-    } catch(...){
-        string s = "Failed to get data";
-        return vector<uint8_t>(s.begin(), s.end());
-    }
+Memtable::Memtable(const string& wal_dir, const string& wal_file,
+                   const string& sst_dir)
+    : skiplist_(new Skiplist()),
+      wal_(new WAL(wal_file, wal_dir)),
+      sst_mgr_(new SSTableManager(sst_dir))
+{}
+
+Memtable::~Memtable() {
+    delete skiplist_;
+    delete wal_;
+    delete sst_mgr_;
 }
 
-void Memtable::recover_memtable(){
-    cout << "Recovering data" << endl;
-    bool is_start = true;
-    auto buff_to_val = [&](const vector<uint8_t>& buff){
-        if(buff.size() < 4) return uint32_t(0);
-        uint32_t net_len;
-        memcpy(&net_len, buff.data(), sizeof(uint32_t));
-        uint32_t len = ntohl(net_len);
-        return len;
+bool Memtable::set_wal(const vector<uint8_t>& data) {
+    try { wal_->write_data(data); return true; }
+    catch (...) { return false; }
+}
+
+bool Memtable::set(string key, vector<uint8_t>& value) {
+    try {
+        skiplist_->insert(key, value);
+        mem_bytes_ += key.size() + value.size() + 64;
+        return true;
+    } catch (...) { return false; }
+}
+
+bool Memtable::remove(string key) {
+    try {
+        skiplist_->remove(key);
+        mem_bytes_ += key.size() + 64;
+        return true;
+    } catch (...) { return false; }
+}
+
+vector<uint8_t> Memtable::get(string key) {
+    // O(log n) lookup: distinguishes not-found vs tombstone vs live value.
+    auto res = skiplist_->lookup(key);
+    if (res.found) {
+        if (res.tombstone) return {}; // deleted in memtable, don't check SSTables
+        return res.value;
+    }
+    // Not in memtable — check SSTables (bloom filter + sparse index inside).
+    return sst_mgr_->get(key);
+}
+
+// ---- WAL recovery ----
+
+void Memtable::recover() {
+    cout << "Recovering WAL...\n";
+    auto read_u32 = [&](const vector<uint8_t>& buf) -> uint32_t {
+        if (buf.size() < 4) return 0;
+        uint32_t v; memcpy(&v, buf.data(), 4); return ntohl(v);
     };
-    bool is_set = true;
-    while(true){
-        vector<uint8_t> total_len_buff = wal->read_data(is_start, sizeof(uint32_t)); 
-        if(total_len_buff.size() < sizeof(uint32_t)) break;
 
-        uint32_t total_len = buff_to_val(total_len_buff);
-        is_start = false;
+    bool first = true;
+    while (true) {
+        auto total_len_buf = wal_->read_data(first, sizeof(uint32_t));
+        if (total_len_buf.size() < sizeof(uint32_t)) break;
+        first = false;
 
-        vector<uint8_t> cmd_buff = wal->read_data(is_start, 1);
-        if(cmd_buff.empty()) break;
-        uint8_t command = cmd_buff[0];
+        uint32_t total_len = read_u32(total_len_buf);
 
-        vector<uint8_t> key_len_buff = wal->read_data(is_start, sizeof(uint32_t));
-        uint32_t key_len = buff_to_val(key_len_buff);
+        auto cmd_buf = wal_->read_data(false, 1);
+        if (cmd_buf.empty()) break;
+        uint8_t command = cmd_buf[0];
 
-        vector<uint8_t> key_buff = wal->read_data(is_start, key_len);
-        string key(key_buff.begin(), key_buff.end());
-        cout << "Recovering key: " << key << endl;
-        cout << "Command: " << int(command) << endl;
-        if(command == 1){
-            vector<uint8_t> value_len_buff = wal->read_data(is_start, sizeof(uint32_t));
-            uint32_t value_len = buff_to_val(value_len_buff);
+        auto key_len_buf = wal_->read_data(false, sizeof(uint32_t));
+        uint32_t key_len = read_u32(key_len_buf);
 
-            vector<uint8_t> value_buff = wal->read_data(is_start, value_len);
-            cout << "Recovering value: ";
-            for(auto & it: value_buff){
-                cout << int(it) << " ";
-            }
-            cout << endl;
-            if(total_len == (1 + 4 + key_len + 4 + value_len)){
-                set_skiplist(key, value_buff);
-            }else{
-                cerr << "WAL is currepted" << endl;
+        auto key_buf = wal_->read_data(false, key_len);
+        string key(key_buf.begin(), key_buf.end());
+
+        if (command == 1) { // SET
+            auto val_len_buf = wal_->read_data(false, sizeof(uint32_t));
+            uint32_t val_len = read_u32(val_len_buf);
+            auto val_buf = wal_->read_data(false, val_len);
+
+            if (total_len == 1 + 4 + key_len + 4 + val_len) {
+                skiplist_->insert(key, val_buf);
+                mem_bytes_ += key.size() + val_buf.size() + 64;
+                cout << "  recovered SET " << key << "\n";
+            } else {
+                cerr << "WAL corrupted at key=" << key << " — stopping recovery\n";
                 break;
             }
-        }else if(command == 3){
-            if(total_len == (1 + 4 + key_len)){
-                remove(key);
-            }else{
-                cerr << "WAL is currepted" << endl;
+        } else if (command == 3) { // DELETE
+            if (total_len == 1 + 4 + key_len) {
+                skiplist_->remove(key);
+                cout << "  recovered DELETE " << key << "\n";
+            } else {
+                cerr << "WAL corrupted at key=" << key << " — stopping recovery\n";
                 break;
             }
+        } else {
+            cerr << "WAL: unknown command " << (int)command << " — stopping\n";
+            break;
         }
     }
+    cout << "Recovery done. " << skiplist_->size << " live keys in memtable.\n";
 }
 
+// ---- Flush ----
+
+void Memtable::flush() {
+    auto entries_raw = skiplist_->snapshot();
+    if (entries_raw.empty()) return;
+
+    // Convert to SSTable::Entry format (include tombstones so they shadow
+    // older SSTable entries during compaction).
+    vector<SSTable::Entry> entries;
+    entries.reserve(entries_raw.size());
+    for (auto& e : entries_raw)
+        entries.push_back({e.key, e.value, e.tombstone});
+
+    if (!sst_mgr_->flush(entries)) {
+        cerr << "Memtable::flush: SSTable write failed — keeping WAL\n";
+        return;
+    }
+
+    // WAL is now redundant; truncate it and reset in-memory state.
+    wal_->truncate();
+    skiplist_->clear();
+    mem_bytes_ = 0;
+
+    sst_mgr_->maybe_compact();
+}
+
+void Memtable::maybe_flush() {
+    if (mem_bytes_ >= config::MEMTABLE_FLUSH_BYTES)
+        flush();
+}

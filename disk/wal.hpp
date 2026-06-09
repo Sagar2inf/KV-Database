@@ -3,41 +3,36 @@
 #include <vector>
 #include <cstring>
 #include <cstdint>
-#include <unistd.h>
+#include "../platform.hpp"
 #include <fcntl.h>
 
 using namespace std;
 
-class WAL{
-    int fr, fw;
-    int size;
-    string walname;
-    string dir;
-    string path;
-public:
-    WAL(string name, string dir){
-        this->walname = name;
-        this->dir = dir;
-        this->path = dir + "/" + name;
-        this->size = 0;
-        fr = open(path.c_str(), O_RDONLY | O_CREAT, 0664);
-        if(fr < 0){
-            cerr << "Failed to open WAL file for reading" << endl;
-             return;
-        }
-        fw = open(path.c_str(), O_WRONLY | O_APPEND, 0664);
-        if(fw < 0){
-            cerr << "Failed to open WAL file for writing" << endl;
-            return;
-        }
-    }
-    void write_data(const vector<uint8_t> data);
-    vector<uint8_t> read_data(bool is_start, int data_size);
-};
-
 /*
-WAL storing structure:
-each entry will be in raw bytes:
-[total_len][command][key_len][key][value_len][value]
-here [value_len][value] will only be added if command = 1 otherwise this string will end on [key]
+WAL entry format (all 4-byte lengths are big-endian / network byte order):
+  [total_len : 4]  bytes that follow (excludes this field itself)
+  [command   : 1]  1=SET, 3=DELETE
+  [key_len   : 4]
+  [key       : key_len]
+  [value_len : 4]  only present when command == 1
+  [value     : value_len]  only present when command == 1
 */
+class WAL {
+    int    fr_, fw_;
+    string path_;
+
+public:
+    WAL(const string& name, const string& dir);
+    ~WAL();
+    WAL(const WAL&) = delete;
+    WAL& operator=(const WAL&) = delete;
+
+    // Append data to the WAL and fdatasync.
+    void write_data(const vector<uint8_t>& data);
+
+    // Read exactly data_size bytes. If is_start, seek to the beginning first.
+    vector<uint8_t> read_data(bool is_start, int data_size);
+
+    // Truncate the WAL to zero bytes and reopen for append.
+    void truncate();
+};

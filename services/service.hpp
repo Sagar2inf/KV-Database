@@ -2,7 +2,7 @@
 #include <vector>
 #include <cstring>
 #include <cstdint>
-#include <arpa/inet.h>
+#include "../platform.hpp"
 
 using namespace std;
 

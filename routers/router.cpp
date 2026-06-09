@@ -1,46 +1,42 @@
 #include "router.hpp"
 
-vector<uint8_t> Router::pass_data(const vector<uint8_t>& request){
-    int validation = service->validate_request(request);
+static vector<uint8_t> str_resp(const string& s) {
+    return vector<uint8_t>(s.begin(), s.end());
+}
 
+vector<uint8_t> Router::pass_data(const vector<uint8_t>& request) {
+    if (service_->validate_request(request) < 0)
+        return str_resp("ERROR: bad request");
 
-    if(validation < 0){
-        string s = "bad request";
-        return vector<uint8_t>(s.begin(), s.end());
+    auto [key_with_cmd, value] = service_->parse_request(request);
+    int    command = int(key_with_cmd[0] - '0');
+    string key     = key_with_cmd.substr(1);
+
+    if (command == 1) { // SET
+        vector<uint8_t> wal_data = service_->transform_to_wal(command, key, value);
+        if (!memtable_->set_wal(wal_data))
+            return str_resp("ERROR: failed to write WAL");
+        if (!memtable_->set(key, value))
+            return str_resp("ERROR: failed to set key");
+        memtable_->maybe_flush();
+        return str_resp("OK");
     }
-    pair<string, vector<uint8_t>> parsed = service->parse_request(request);
-    command = int(parsed.first[0] - '0');
-    key = parsed.first.substr(1);
-    value = parsed.second;
-    
-    vector<uint8_t> wal_data = service->transform_to_wal(command, key, value);
-    bool res = memtable->set_wal(wal_data);
-    if(!res){
-        string s = "failed to write data to wal";
-        return vector<uint8_t>(s.begin(), s.end());
+
+    if (command == 2) { // GET — no WAL write
+        vector<uint8_t> val = memtable_->get(key);
+        if (val.empty()) return str_resp("NOT_FOUND");
+        return val;
     }
-    if(command == 1){
-        bool res1 = memtable->set_skiplist(key, value);
-        if(!res1){
-            string s = "failed to set data";
-            return vector<uint8_t>(s.begin(), s.end());
-        }else{
-            string s = "data set successfully";
-            return vector<uint8_t>(s.begin(), s.end());
-        }
-    }else if(command == 2){
-        vector<uint8_t> res1 = memtable->get(key);
-        cout << "data get successfully: " << endl;
-        for(auto & it: res1){
-            cout << int(it) << " ";
-        }
-        cout << endl;
-        return res1;
-    }else if(command == 3){
-        bool res1 = memtable->remove(key);
-        return {};
-    }else{
-        string s = "no query possible";
-        return vector<uint8_t>(s.begin(), s.end());
+
+    if (command == 3) { // DELETE
+        vector<uint8_t> empty;
+        vector<uint8_t> wal_data = service_->transform_to_wal(command, key, empty);
+        if (!memtable_->set_wal(wal_data))
+            return str_resp("ERROR: failed to write WAL");
+        memtable_->remove(key);
+        memtable_->maybe_flush();
+        return str_resp("OK");
     }
+
+    return str_resp("ERROR: unknown command");
 }

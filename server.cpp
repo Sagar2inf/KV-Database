@@ -1,110 +1,172 @@
-#include<iostream>
-#include<cstring>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <fcntl.h>
-#include <arpa/inet.h>
-#include <sys/select.h>
+#include <iostream>
+#include <cstring>
+#include <csignal>
 #include <vector>
-#include <unistd.h>
-#include <string>
-#include <netdb.h>
+#include <filesystem>
+#include "./platform.hpp"
+
+#ifdef _WIN32
+  #include <winsock2.h>
+  #include <ws2tcpip.h>
+  using sock_t   = SOCKET;
+  using nfds_t   = ULONG;
+  #define poll(fds, nfds, to) WSAPoll((fds), (nfds), (to))
+  #ifndef POLLRDHUP
+    #define POLLRDHUP 0
+  #endif
+  static inline void close_sock(sock_t s) { closesocket(s); }
+  static inline sock_t invalid_sock() { return INVALID_SOCKET; }
+  static inline bool   sock_ok(sock_t s) { return s != INVALID_SOCKET; }
+#else
+  #include <sys/socket.h>
+  #include <netinet/in.h>
+  #include <arpa/inet.h>
+  #include <poll.h>
+  #include <unistd.h>
+  using sock_t = int;
+  static inline void   close_sock(sock_t s) { close(s); }
+  static inline sock_t invalid_sock() { return -1; }
+  static inline bool   sock_ok(sock_t s) { return s >= 0; }
+#endif
+
 #include "./routers/router.hpp"
 #include "./transport/transport.hpp"
-#include "./memtable/memtable.hpp"
+#include "./config.hpp"
 
-Router router;
-Transport transport;
-int main(){
-    int sockfd, portno = 9000, newsockfd;
-    sockfd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if(sockfd < 0){
-        std::cout<<"failed to start socket" << std::endl;
-    }else{
-        std::cout<<"Socket is started" << std::endl;
-    }
-    struct sockaddr_in serv_addr, cli_addr;
-    memset((char*)&serv_addr, 0, sizeof(serv_addr));
+namespace fs = filesystem;
 
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(portno);
-    serv_addr.sin_addr.s_addr = INADDR_ANY;
+static volatile sig_atomic_t g_stop = 0;
+static void on_signal(int) { g_stop = 1; }
 
-    
-    if(bind(sockfd, (sockaddr*)&serv_addr, sizeof(serv_addr))){
-        std::cout<<"Failed to bind socket with address" << std::endl;
-    }else{
-        std::cout<<"Socket bind with address" << std::endl;
+int main() {
+#ifdef _WIN32
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+#endif
+
+    fs::create_directories(config::WAL_DIR);
+    fs::create_directories(config::SST_DIR);
+
+#ifndef _WIN32
+    struct sigaction sa{};
+    sa.sa_handler = on_signal;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGTERM, &sa, nullptr);
+    sigaction(SIGINT,  &sa, nullptr);
+    signal(SIGPIPE, SIG_IGN);
+#else
+    signal(SIGTERM, on_signal);
+    signal(SIGINT,  on_signal);
+#endif
+
+    Router    router;
+    Transport transport;
+
+    sock_t server_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (!sock_ok(server_fd)) { cerr << "socket() failed\n"; return 1; }
+
+    int opt = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR,
+               reinterpret_cast<const char*>(&opt), sizeof(opt));
+
+    sockaddr_in addr{};
+    addr.sin_family      = AF_INET;
+    addr.sin_port        = htons(config::PORT);
+    addr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(server_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+        cerr << "bind() failed\n"; return 1;
     }
-    if(listen(sockfd, 5)){
-        std::cout<<"Failed to listening" << std::endl;
-    }else{
-        std::cout<<"Started to listening on local port 9000" << std::endl;
+    if (listen(server_fd, config::BACKLOG) < 0) {
+        cerr << "listen() failed\n"; return 1;
     }
-    
+
     router.recover();
+    cout << "Server listening on port " << config::PORT << "\n";
 
-    std::vector<int> clients;
-    while(true){
-        fd_set fr, fw, fe;
-        FD_ZERO(&fr);
-        FD_ZERO(&fw);
-        FD_SET(sockfd, &fr);
-        FD_SET(sockfd, &fw);
-        int max_fd = sockfd;
-        for(int client: clients){
-            FD_SET(client, &fr);
-            FD_SET(client, &fw);
-            max_fd = std::max(max_fd, client);
+    // pollfd.fd is SOCKET on Windows, int on Linux — use sock_t throughout.
+    struct PollEntry { sock_t fd; short events; short revents; };
+    auto to_pollfd = [](const PollEntry& e) -> pollfd {
+        pollfd p{};
+        p.fd      = e.fd;
+        p.events  = e.events;
+        p.revents = e.revents;
+        return p;
+    };
+
+    vector<PollEntry> clients;
+    clients.push_back({server_fd, POLLIN, 0});
+
+    while (!g_stop) {
+        // Build pollfd array for this iteration.
+        vector<pollfd> fds;
+        fds.reserve(clients.size());
+        for (auto& c : clients) fds.push_back(to_pollfd(c));
+
+        int ready = poll(fds.data(), (nfds_t)fds.size(), 1000 /*ms*/);
+        if (ready < 0) {
+#ifndef _WIN32
+            if (errno == EINTR) continue;
+#endif
+            cerr << "poll() error\n"; break;
         }
-        select(max_fd + 1, &fr, &fw, NULL, NULL);
-        if(FD_ISSET(sockfd, &fr)){
-            socklen_t clilen = sizeof(cli_addr);
-            newsockfd = accept(sockfd, (sockaddr*)&cli_addr, &clilen);
-            clients.push_back(newsockfd);
-            std::cout << "new client connected " << newsockfd << std::endl;
-        }
-        for(auto it = clients.begin(); it != clients.end();){
-            int client = *it;
-            if(FD_ISSET(client, &fr)){
-                std::vector<uint8_t> data = transport.read_data(client);
-                if(data.empty()){
-                    cout << "client disconnected" << endl;
-                    close(client);
-                    it = clients.erase(it);
-                    continue;
-                }    
-                
-                std::vector<uint8_t> res = router.pass_data(data);
-                cout << "writing data" << endl;
-                bool chk = transport.write_data(client, res);
-                if(!chk){
-                    cout << "Couldn't sent data" << endl;
+
+        // Copy revents back.
+        for (size_t i = 0; i < clients.size(); i++)
+            clients[i].revents = fds[i].revents;
+
+        // New connection on listening socket.
+        if (clients[0].revents & POLLIN) {
+            sockaddr_in cli_addr{};
+            socklen_t   cli_len = sizeof(cli_addr);
+            sock_t cli_fd = accept(server_fd,
+                                   reinterpret_cast<sockaddr*>(&cli_addr), &cli_len);
+            if (sock_ok(cli_fd)) {
+                if ((int)clients.size() - 1 >= config::MAX_CLIENTS) {
+                    cerr << "Max clients reached; rejecting\n";
+                    close_sock(cli_fd);
+                } else {
+                    cout << "Client connected fd=" << cli_fd << "\n";
+                    clients.push_back({cli_fd, POLLIN, 0});
                 }
-                cout << "data written" << endl;
             }
-            it++;
+        }
+
+        // Handle existing clients (backwards so erase is safe).
+        for (int i = (int)clients.size() - 1; i >= 1; i--) {
+            short rev = clients[i].revents;
+            if (!(rev & (POLLIN | POLLERR | POLLHUP))) continue;
+
+            if (rev & (POLLERR | POLLHUP)) {
+                close_sock(clients[i].fd);
+                clients.erase(clients.begin() + i);
+                continue;
+            }
+
+            vector<uint8_t> data = transport.read_data((int)clients[i].fd);
+            if (data.empty()) {
+                cout << "Client disconnected fd=" << clients[i].fd << "\n";
+                close_sock(clients[i].fd);
+                clients.erase(clients.begin() + i);
+                continue;
+            }
+
+            vector<uint8_t> resp = router.pass_data(data);
+            if (!transport.write_data((int)clients[i].fd, resp)) {
+                cerr << "Write failed; closing fd=" << clients[i].fd << "\n";
+                close_sock(clients[i].fd);
+                clients.erase(clients.begin() + i);
+            }
         }
     }
+
+    cout << "\nShutting down...\n";
+    router.flush_memtable();
+    for (int i = 1; i < (int)clients.size(); i++) close_sock(clients[i].fd);
+    close_sock(server_fd);
+#ifdef _WIN32
+    WSACleanup();
+#endif
+    cout << "Goodbye.\n";
+    return 0;
 }
-// https://www.linkedin.com/posts/quantitative-finance-cohort-25_roadmap-for-learning-low-latency-c-activity-7301555373499367424-dIg8/
-
-/*
-structure of sockaddr_in: 
-struct sockaddr_in{
-    sin_family = AF_INET; -> more common
-    sin_port = htons(port); -> port on which server is running 
-    struct sin_addr s_addr = INADDR_ANY or 27.0.0.01; -> host name
-    and an array which is generally stay empty
-}
-
-htons: -> learn about endian concept where (htons and ntohs) are used.
- 
-
-fd_set -> if there are multiple client then store their fd in binary so that no client have to wait for their turn manually
-
-everysocket is default blocking socket, learn about non-blocking sockets also
-*/
-
-
-
